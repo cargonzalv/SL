@@ -1,0 +1,15 @@
+metadata:
+  name: sps-lib
+  description: "Tizen Ads library"
+  labels:
+    stack: javascript
+    practice: "engineering"
+    jira-project: "PP" 
+    jira-board: 82
+    public: false
+    sensitive: false
+
+spec:
+  owner: cg-sps
+  type: library
+  lifecycle: production

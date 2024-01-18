@@ -1,0 +1,153 @@
+name: Deploy to S3
+
+on:
+  push:
+    tags:
+      - "*"
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+env:
+  AWS_DEFAULT_REGION: us-east-1
+  S3_BUCKET_ORIGIN: adgear-ads-sdk-production
+  DISTRIBUTION_ID: E296JCMLJR76FL
+
+jobs:
+  shell-lint:
+    runs-on: [ self-hosted, ubuntu-22.04-medium ]
+    name: Lint Shell Script
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Lint cloudfront_invalidation.sh
+        uses: reviewdog/action-shellcheck@v1
+        with:
+          path: "./cloudfront_invalidation.sh"
+  test:
+    runs-on: [ self-hosted, ubuntu-22.04-medium ]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - uses: pnpm/action-setup@v2.2.4
+        with:
+          version: 8.3.1
+
+      - name: Setup node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+          cache: "pnpm"
+
+      # Initializes the CodeQL tools for scanning.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: javascript, typescript
+
+      - name: Run test
+        run: |
+          curl -s -u "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" https://adgear.jfrog.io/adgear/api/npm/auth > ./.npmrc
+          echo "registry=https://adgear.jfrog.io/artifactory/api/npm/trader-npm/" >> ./.npmrc
+          pnpm install
+          pnpm test
+
+      # Autobuild attempts to build any compiled languages  (C/C++, C#, or Java).
+      # If this step fails, then you should remove it and run the build manually (see below)
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v2
+
+      # CodeQL Analysis
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+
+  build:
+    needs: [ test ]
+    runs-on: [ self-hosted, ubuntu-22.04-medium ]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - uses: pnpm/action-setup@v2.2.4
+        with:
+          version: 8.3.1
+
+      - name: Setup node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+          cache: "pnpm"
+
+      - name: Execute pnpm task
+        run: |
+
+          curl -s -u "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" https://adgear.jfrog.io/adgear/api/npm/auth > ./.npmrc
+          echo "registry=https://adgear.jfrog.io/artifactory/api/npm/trader-npm/" >> ./.npmrc
+          pnpm install
+          ls .
+          pnpm build
+
+        env:
+          ARTIFACTORY_USER: ${{ secrets.ARTIFACTORY_USERNAME }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.ARTIFACTORY_PASSWORD }}
+
+      - name: Copy release file
+        run: |
+          RELEASE_FILE="sps-lib.${GITHUB_REF_NAME//\//\-}-min.js"
+          echo "// Version: $GITHUB_REF_NAME" > dist/sps-lib.babel.min.js
+          mkdir -p output && cp dist/sps-lib.babel.min.js output/"$RELEASE_FILE"
+
+      - name: Archive production artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-artifacts
+          path: output
+
+  upload-to-s3:
+    needs: build
+    permissions: # permissions required by hashicorp/vault-action
+      id-token: write
+      contents: read
+    runs-on: [ self-hosted, ubuntu-22.04-medium ]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # Retrieve secrets from Vault
+      - name: Retrieve secret from Vault
+        uses: hashicorp/vault-action@v2.4.3
+        with:
+          method: jwt                               # leave as is
+          path: adgear-github-actions               # leave as is (dedicated vault role for github actions)
+          url: https://vault.int.adgear.com:8200    # leave as is (production vault instance)
+          secrets: |
+            secret/cg-sps/sps-lib/prod aws_role_id | AWS_ROLE_ID;
+            secret/cg-sps/sps-lib/prod aws_role_name | AWS_ROLE_NAME
+    
+      # Configure AWS, retrieve secrets from Vault
+      - name: Configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ROLE_ID }}:role/${{ env.AWS_ROLE_NAME }}
+          role-session-name: adgear-sps-lib
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: production-artifacts
+          path: output
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp output/ s3://${{ env.S3_BUCKET_ORIGIN }}/ --recursive
+        env:
+          AWS_DEFAULT_REGION: ${{ env.AWS_DEFAULT_REGION }}
+      
+      - name: Run CloudFront Invalidation Script
+        run: |
+          RELEASE_FILE="sps-lib.${GITHUB_REF_NAME//\//\-}-min.js"
+          ./cloudfront_invalidation.sh ${{ env.DISTRIBUTION_ID }} "$RELEASE_FILE"
